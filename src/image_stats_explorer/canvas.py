@@ -1,4 +1,4 @@
-"""Scrollable image canvas with an editable pixel-coordinate selection."""
+"""Scrollable image canvas with an editable pixel-coordinate bbox."""
 
 from __future__ import annotations
 
@@ -8,21 +8,24 @@ from PySide6.QtWidgets import QWidget
 
 
 class ImageCanvas(QWidget):
-    """Render an image, one ROI overlay, and an editable eight-handle ROI."""
+    """Render an image, an analysis overlay, and an editable bbox."""
 
-    roi_changed = Signal(tuple)
+    bbox_changed = Signal(tuple)
     zoom_requested = Signal(float)
+    pan_requested = Signal(float, float)
 
     def __init__(self) -> None:
         super().__init__()
         self._pixmap = QPixmap()
         self._overlay = QImage()
         self._overlay_opacity = 0.58
-        self._roi = (0, 0, 0, 0)
+        self._bbox: tuple[int, int, int, int] | None = None
+        self._context_bounds: tuple[int, int, int, int] | None = None
         self._scale = 1.0
         self._drag_mode: str | None = None
         self._drag_origin = QPointF()
-        self._start_roi = self._roi
+        self._start_bbox: tuple[int, int, int, int] | None = None
+        self._pan_origin = QPointF()
         self.setMouseTracking(True)
 
     @property
@@ -30,43 +33,58 @@ class ImageCanvas(QWidget):
         return self._pixmap.width(), self._pixmap.height()
 
     @property
-    def roi(self) -> tuple[int, int, int, int]:
-        return self._roi
+    def bbox(self) -> tuple[int, int, int, int] | None:
+        return self._bbox
 
     def set_image(self, image: QImage) -> None:
         self._pixmap = QPixmap.fromImage(image)
         self._overlay = QImage()
         self._overlay_opacity = 0.58
-        self._roi = (0, 0, image.width(), image.height())
+        self._bbox = None
+        self._context_bounds = None
         self._update_canvas_size()
         self.update()
 
-    def set_roi(self, roi: tuple[int, int, int, int], emit: bool = False) -> None:
+    def set_bbox(
+        self, bbox: tuple[int, int, int, int] | None, emit: bool = False
+    ) -> None:
+        if bbox is None:
+            if self._bbox is None:
+                return
+            self._bbox = None
+            self.update()
+            return
         width, height = self.image_size
-        x, y, roi_width, roi_height = roi
+        x, y, bbox_width, bbox_height = bbox
         x = max(0, min(width - 1, int(x))) if width else 0
         y = max(0, min(height - 1, int(y))) if height else 0
-        roi_width = max(1, min(width - x, int(roi_width))) if width else 0
-        roi_height = max(1, min(height - y, int(roi_height))) if height else 0
-        updated = (x, y, roi_width, roi_height)
-        if updated == self._roi:
+        bbox_width = max(1, min(width - x, int(bbox_width))) if width else 0
+        bbox_height = max(1, min(height - y, int(bbox_height))) if height else 0
+        updated = (x, y, bbox_width, bbox_height)
+        if updated == self._bbox:
             return
-        self._roi = updated
+        self._bbox = updated
         self.update()
         if emit:
-            self.roi_changed.emit(updated)
+            self.bbox_changed.emit(updated)
+
+    def set_context_bounds(self, bounds: tuple[int, int, int, int] | None) -> None:
+        self._context_bounds = bounds
+        self.update()
 
     def set_overlay_image(
         self,
         overlay: QImage | None,
         opacity: float = 1.0,
     ) -> None:
-        """Set one image whose pixel size must match the current ROI."""
+        """Set one image whose pixel size must match the current bbox."""
 
         candidate = overlay if overlay is not None else QImage()
         candidate_size = (candidate.width(), candidate.height())
-        if not candidate.isNull() and candidate_size != self._roi[2:]:
-            raise ValueError("overlay dimensions must match the ROI")
+        if self._bbox is None and not candidate.isNull():
+            raise ValueError("an overlay requires a bbox")
+        if not candidate.isNull() and candidate_size != self._bbox[2:]:
+            raise ValueError("overlay dimensions must match the bbox")
         self._overlay = candidate
         self._overlay_opacity = opacity
         self.update()
@@ -82,8 +100,8 @@ class ImageCanvas(QWidget):
             round(self._pixmap.height() * self._scale),
         )
 
-    def _display_rect(self) -> QRectF:
-        x, y, width, height = self._roi
+    def _display_rect(self, bounds: tuple[int, int, int, int]) -> QRectF:
+        x, y, width, height = bounds
         return QRectF(
             x * self._scale,
             y * self._scale,
@@ -96,15 +114,23 @@ class ImageCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.drawPixmap(self.rect(), self._pixmap)
-        roi_rect = self._display_rect()
-        if not self._overlay.isNull():
+        bbox_rect = self._display_rect(self._bbox) if self._bbox else None
+        if not self._overlay.isNull() and bbox_rect is not None:
             painter.setOpacity(self._overlay_opacity)
-            painter.drawImage(roi_rect, self._overlay)
+            painter.drawImage(bbox_rect, self._overlay)
             painter.setOpacity(1.0)
+        if self._context_bounds is not None:
+            pen = QPen(QColor(0, 190, 255), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(self._display_rect(self._context_bounds))
+        if bbox_rect is None:
+            return
         painter.setPen(QPen(QColor(255, 80, 35), 2))
-        painter.drawRect(roi_rect)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(bbox_rect)
         painter.setBrush(QColor(255, 255, 255))
-        for point in self._handle_points(roi_rect).values():
+        for point in self._handle_points(bbox_rect).values():
             painter.drawRect(QRectF(point.x() - 4, point.y() - 4, 8, 8))
 
     @staticmethod
@@ -121,37 +147,52 @@ class ImageCanvas(QWidget):
         }
 
     def _hit_mode(self, position: QPointF) -> str:
-        for name, point in self._handle_points(self._display_rect()).items():
+        if self._bbox is None:
+            return "new"
+        rect = self._display_rect(self._bbox)
+        for name, point in self._handle_points(rect).items():
             if (
                 abs(position.x() - point.x()) <= 8
                 and abs(position.y() - point.y()) <= 8
             ):
                 return name
-        if self._display_rect().contains(position):
+        if rect.contains(position):
             return "move"
         return "new"
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() != Qt.MouseButton.LeftButton or self._pixmap.isNull():
+        if self._pixmap.isNull():
             return
-        self._drag_mode = (
-            "new"
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier
-            else self._hit_mode(event.position())
-        )
+        if event.button() == Qt.MouseButton.RightButton:
+            self._drag_mode = "pan"
+            self._pan_origin = event.globalPosition()
+            event.accept()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._drag_mode = self._hit_mode(event.position())
         self._drag_origin = event.position() / self._scale
-        self._start_roi = self._roi
+        self._start_bbox = self._bbox
         if self._drag_mode == "new":
             x = round(self._drag_origin.x())
             y = round(self._drag_origin.y())
-            self.set_roi((x, y, 1, 1), emit=True)
-            self._start_roi = self._roi
+            self.set_bbox((x, y, 1, 1), emit=True)
+            self._start_bbox = self._bbox
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._drag_mode is None:
             return
+        if self._drag_mode == "pan":
+            current = event.globalPosition()
+            delta = current - self._pan_origin
+            self._pan_origin = current
+            self.pan_requested.emit(delta.x(), delta.y())
+            event.accept()
+            return
+        if self._start_bbox is None:
+            return
         current = event.position() / self._scale
-        sx, sy, sw, sh = self._start_roi
+        sx, sy, sw, sh = self._start_bbox
         dx = round(current.x() - self._drag_origin.x())
         dy = round(current.y() - self._drag_origin.y())
         if self._drag_mode == "new":
@@ -177,7 +218,7 @@ class ImageCanvas(QWidget):
         width, height = self.image_size
         left, top = max(0, left), max(0, top)
         right, bottom = min(width, right), min(height, bottom)
-        self.set_roi((left, top, right - left, bottom - top), emit=True)
+        self.set_bbox((left, top, right - left, bottom - top), emit=True)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         del event

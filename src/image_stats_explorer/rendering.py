@@ -14,6 +14,8 @@ DENSITY_VIEW = "density"
 COMPONENTS_VIEW = "components"
 ENVELOPES_VIEW = "envelopes"
 COMPARISON_VIEW = "comparison"
+CONTEXT_COLOR = (0, 190, 255, 255)
+BBOX_COLOR = (255, 80, 35, 255)
 
 
 def value_range() -> tuple[float, float]:
@@ -224,7 +226,47 @@ def _composite_full(
         raise ValueError("overlay dimensions must match the protocol pixel_bbox")
     base = image.convert("RGBA")
     base.alpha_composite(overlay, (result.pixel_bbox.left, result.pixel_bbox.top))
+    _draw_semantic_bounds(base, result)
     return base
+
+
+def _draw_dashed_rectangle(
+    draw: ImageDraw.ImageDraw,
+    bounds: tuple[int, int, int, int],
+    fill: tuple[int, int, int, int],
+    width: int = 2,
+    dash: int = 6,
+    gap: int = 4,
+) -> None:
+    left, top, right, bottom = bounds
+    right -= 1
+    bottom -= 1
+    for start in range(left, right + 1, dash + gap):
+        end = min(start + dash - 1, right)
+        draw.line((start, top, end, top), fill=fill, width=width)
+        draw.line((start, bottom, end, bottom), fill=fill, width=width)
+    for start in range(top, bottom + 1, dash + gap):
+        end = min(start + dash - 1, bottom)
+        draw.line((left, start, left, end), fill=fill, width=width)
+        draw.line((right, start, right, end), fill=fill, width=width)
+
+
+def _draw_semantic_bounds(image: Image.Image, result: AnalysisResult) -> None:
+    """Draw protocol context and bbox frames on a full-size rendered image."""
+
+    draw = ImageDraw.Draw(image)
+    context = result.context_bounds
+    _draw_dashed_rectangle(
+        draw,
+        (context.left, context.top, context.right, context.bottom),
+        CONTEXT_COLOR,
+    )
+    bbox = result.pixel_bbox
+    draw.rectangle(
+        (bbox.left, bbox.top, bbox.right - 1, bbox.bottom - 1),
+        outline=BBOX_COLOR,
+        width=2,
+    )
 
 
 def _titled(image: Image.Image, title: str) -> Image.Image:

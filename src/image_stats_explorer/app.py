@@ -101,11 +101,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Image Stats Explorer")
         self.resize(1180, 760)
         self._image: Image.Image | None = None
-        self._selection = (0, 0, 0, 0)
+        self._bbox: tuple[int, int, int, int] | None = None
         self._result: AnalysisResult | None = None
         self._busy = False
         self._generation = 0
-        self._syncing_roi = False
+        self._syncing_bbox = False
         self._syncing_scroll = False
         self._updating_parameters = False
         self._scale = 1.0
@@ -113,6 +113,7 @@ class MainWindow(QMainWindow):
         self._building_ui = True
         self._build_ui()
         self._building_ui = False
+        self._sync_bbox_inputs(None)
         self._show_single()
         self._refresh_actions()
 
@@ -140,13 +141,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(page)
 
     def _canvas_scroll(self, canvas: ImageCanvas) -> QScrollArea:
-        canvas.roi_changed.connect(self._roi_from_canvas)
+        canvas.bbox_changed.connect(self._bbox_from_canvas)
         canvas.zoom_requested.connect(self._zoom_by)
         scroll = QScrollArea()
         scroll.setWidget(canvas)
         scroll.setWidgetResizable(False)
         scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        canvas.pan_requested.connect(
+            lambda dx, dy, target=scroll: self._pan_scroll(target, dx, dy)
+        )
         return scroll
+
+    @staticmethod
+    def _pan_scroll(scroll: QScrollArea, dx: float, dy: float) -> None:
+        horizontal = scroll.horizontalScrollBar()
+        vertical = scroll.verticalScrollBar()
+        horizontal.setValue(horizontal.value() - round(dx))
+        vertical.setValue(vertical.value() - round(dy))
 
     def _connect_scroll_sync(self) -> None:
         left_h = self.left_scroll.horizontalScrollBar()
@@ -172,11 +183,11 @@ class MainWindow(QMainWindow):
         fit_button = QPushButton("适配窗口")
         fit_button.clicked.connect(self._fit_window)
         controls.addWidget(fit_button)
-        hint = QLabel("Shift+拖拽重新框选；框内拖动；控制点缩放；Ctrl+滚轮缩放")
+        hint = QLabel("左键框选/移动/缩放 bbox；右键拖拽平移；Ctrl+滚轮缩放")
         hint.setWordWrap(True)
         controls.addWidget(hint)
 
-        self.roi_inputs = self._roi_controls(controls)
+        self.bbox_inputs = self._bbox_controls(controls)
         defaults = AnalysisParameters()
         parameter_form = QFormLayout()
         self.resize_size_spin = self._int_parameter(
@@ -277,14 +288,14 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.status)
         controls.addStretch(1)
 
-    def _roi_controls(self, controls: QVBoxLayout) -> list[QSpinBox]:
+    def _bbox_controls(self, controls: QVBoxLayout) -> list[QSpinBox]:
         form = QFormLayout()
         inputs: list[QSpinBox] = []
         for label in ("x", "y", "width", "height"):
             spin = QSpinBox()
             spin.setRange(0 if label in ("x", "y") else 1, 1_000_000)
             spin.valueChanged.connect(
-                lambda _value, current=inputs: self._roi_from_inputs(current)
+                lambda _value, current=inputs: self._bbox_from_inputs(current)
             )
             inputs.append(spin)
             form.addRow(label, spin)
@@ -363,9 +374,9 @@ class MainWindow(QMainWindow):
         qimage = _qimage(self._image)
         self.left_canvas.set_image(qimage)
         self.right_canvas.set_image(qimage)
-        self._selection = self.left_canvas.roi
-        self._sync_roi_inputs(self._selection)
-        self._invalidate("图片已加载；点击“计算”生成结果")
+        self._bbox = None
+        self._sync_bbox_inputs(None)
+        self._invalidate("请左键拖拽框选 bbox")
         self._fit_window()
 
     def _fit_window(self) -> None:
@@ -386,31 +397,32 @@ class MainWindow(QMainWindow):
         self.left_canvas.set_scale(self._scale)
         self.right_canvas.set_scale(self._scale)
 
-    def _sync_roi_inputs(self, roi: tuple[int, int, int, int]) -> None:
-        self._syncing_roi = True
-        for spin, value in zip(self.roi_inputs, roi, strict=True):
+    def _sync_bbox_inputs(self, bbox: tuple[int, int, int, int] | None) -> None:
+        self._syncing_bbox = True
+        for spin, value in zip(self.bbox_inputs, bbox or (0, 0, 1, 1), strict=True):
             spin.setValue(value)
-        self._syncing_roi = False
+            spin.setEnabled(bbox is not None)
+        self._syncing_bbox = False
 
-    def _roi_from_canvas(self, roi: tuple[int, int, int, int]) -> None:
-        self._set_shared_roi(roi)
+    def _bbox_from_canvas(self, bbox: tuple[int, int, int, int]) -> None:
+        self._set_shared_bbox(bbox)
 
-    def _roi_from_inputs(self, inputs: list[QSpinBox]) -> None:
-        if self._syncing_roi or self._image is None or len(inputs) != 4:
+    def _bbox_from_inputs(self, inputs: list[QSpinBox]) -> None:
+        if self._syncing_bbox or self._image is None or len(inputs) != 4:
             return
-        self._set_shared_roi(tuple(spin.value() for spin in inputs))
+        self._set_shared_bbox(tuple(spin.value() for spin in inputs))
 
-    def _set_shared_roi(self, roi: tuple[int, int, int, int]) -> None:
+    def _set_shared_bbox(self, bbox: tuple[int, int, int, int]) -> None:
         if self._image is None:
             return
-        self.left_canvas.set_roi(roi, emit=False)
-        updated = self.left_canvas.roi
-        self.right_canvas.set_roi(updated, emit=False)
-        self._sync_roi_inputs(updated)
-        if updated == self._selection:
+        self.left_canvas.set_bbox(bbox, emit=False)
+        updated = self.left_canvas.bbox
+        self.right_canvas.set_bbox(updated, emit=False)
+        self._sync_bbox_inputs(updated)
+        if updated == self._bbox:
             return
-        self._selection = updated
-        self._invalidate("选区已改变；结果已过期，请重新计算")
+        self._bbox = updated
+        self._invalidate("bbox 已改变；结果已过期，请重新计算")
 
     def _restore_defaults(self) -> None:
         defaults = AnalysisParameters()
@@ -442,27 +454,25 @@ class MainWindow(QMainWindow):
         self._result = None
         self.left_canvas.set_overlay_image(None)
         self.right_canvas.set_overlay_image(None)
+        self.left_canvas.set_context_bounds(None)
+        self.right_canvas.set_context_bounds(None)
         self.status.setText(message)
         self._refresh_actions()
 
     def _refresh_actions(self) -> None:
-        has_image = (
-            self._image is not None
-            and self._selection[2] > 0
-            and self._selection[3] > 0
-        )
+        has_bbox = self._image is not None and self._bbox is not None
         self.compute_button.setEnabled(
-            has_image and self._parameter_error() is None and not self._busy
+            has_bbox and self._parameter_error() is None and not self._busy
         )
         self.save_button.setEnabled(self._result is not None and not self._busy)
 
     def _calculate(self) -> None:
-        if self._image is None or self._busy:
+        if self._image is None or self._bbox is None or self._busy:
             return
         try:
             parameters = self._current_parameters()
             bbox = NormalizedBBox.from_pixel_xywh(
-                *self._selection,
+                *self._bbox,
                 self._image.width,
                 self._image.height,
             )
@@ -490,6 +500,10 @@ class MainWindow(QMainWindow):
             self._refresh_actions()
             return
         self._result = result
+        context = result.context_bounds
+        bounds = (context.left, context.top, context.width, context.height)
+        self.left_canvas.set_context_bounds(bounds)
+        self.right_canvas.set_context_bounds(bounds)
         self._render_view()
         self.status.setText(self._result_status())
         self._refresh_actions()
