@@ -1,0 +1,33 @@
+[project]
+name = "image-stats-explorer"
+version = "0.1.0"
+description = "Interactive explorer for image statistic maps"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=11.0",
+    "pyside6-essentials>=6.8,<7",
+    "image-stats-protocol==1.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = ["pyinstaller>=6.11", "ruff>=0.9"]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+
+[tool.uv.sources.image-stats-protocol]
+git = "ssh://git@github.com/ZhangChiAng/image-stats-protocol.git"
+tag = "v1.0.0"
+
+[tool.ruff]
+line-length = 88
+
+[tool.setuptools.packages.find]
+where = ["src"]
