@@ -53,32 +53,25 @@ def _content_values(result: AnalysisResult, values: np.ndarray) -> np.ndarray:
     return values[slices]
 
 
-def _roi_size(result: AnalysisResult) -> tuple[int, int]:
-    return result.pixel_bbox.width, result.pixel_bbox.height
+def _restore_context(
+    result: AnalysisResult,
+    content_image: Image.Image,
+    resampling: Image.Resampling,
+) -> Image.Image:
+    """Restore a content-sized image to the original-resolution context."""
 
-
-def _context_to_roi(result: AnalysisResult, image: Image.Image) -> Image.Image:
-    """Crop a restored original-resolution context to the selected bbox."""
-
+    content = result.content_bounds
+    expected_size = (content.width, content.height)
+    if content_image.size != expected_size:
+        raise ValueError("content image dimensions must match content_bounds")
     context_size = result.transform.source_size
-    if image.size != context_size:
-        raise ValueError("context image dimensions must match transform.source_size")
-    context = result.context_bounds
-    bbox = result.pixel_bbox
-    crop = (
-        bbox.left - context.left,
-        bbox.top - context.top,
-        bbox.right - context.left,
-        bbox.bottom - context.top,
-    )
-    rendered = image.crop(crop)
-    if rendered.size != _roi_size(result):
-        raise ValueError("rendered overlay dimensions must match pixel_bbox")
-    return rendered
+    if content_image.size != context_size:
+        return content_image.resize(context_size, resampling)
+    return content_image
 
 
 def colorize(result: AnalysisResult) -> Image.Image:
-    """Render valid density values back onto the selected original-image bbox."""
+    """Render valid density values onto the complete original-resolution context."""
 
     low, high = value_range()
     scale = high - low
@@ -88,10 +81,7 @@ def colorize(result: AnalysisResult) -> Image.Image:
         dtype=np.uint8,
     ).reshape(*densities.shape, 4)
     content_image = Image.fromarray(rgba, mode="RGBA")
-    context_size = result.transform.source_size
-    if content_image.size != context_size:
-        content_image = content_image.resize(context_size, Image.Resampling.BILINEAR)
-    return _context_to_roi(result, content_image)
+    return _restore_context(result, content_image, Image.Resampling.BILINEAR)
 
 
 def _region_color(index: int) -> tuple[int, int, int, int]:
@@ -108,11 +98,11 @@ def _region_color(index: int) -> tuple[int, int, int, int]:
     return palette[index % len(palette)]
 
 
-def _region_roi_bounds(
+def _region_context_bounds(
     result: AnalysisResult,
     bounds: PixelBounds,
-) -> tuple[int, int, int, int] | None:
-    """Map a canvas region through context coordinates and clip it to the ROI."""
+) -> tuple[int, int, int, int]:
+    """Map a canvas region to local coordinates in the complete context."""
 
     content = result.content_bounds
     if (
@@ -124,46 +114,27 @@ def _region_roi_bounds(
         raise ValueError("protocol region must stay inside content_bounds")
 
     source_width, source_height = result.transform.source_size
-    context = result.context_bounds
-    left = context.left + math.floor(
-        (bounds.left - content.left) * source_width / content.width
-    )
-    top = context.top + math.floor(
-        (bounds.top - content.top) * source_height / content.height
-    )
-    right = context.left + math.ceil(
-        (bounds.right - content.left) * source_width / content.width
-    )
-    bottom = context.top + math.ceil(
-        (bounds.bottom - content.top) * source_height / content.height
-    )
-
-    bbox = result.pixel_bbox
-    left = max(left, bbox.left)
-    top = max(top, bbox.top)
-    right = min(right, bbox.right)
-    bottom = min(bottom, bbox.bottom)
-    if right <= left or bottom <= top:
-        return None
+    left = math.floor((bounds.left - content.left) * source_width / content.width)
+    top = math.floor((bounds.top - content.top) * source_height / content.height)
+    right = math.ceil((bounds.right - content.left) * source_width / content.width)
+    bottom = math.ceil((bounds.bottom - content.top) * source_height / content.height)
     return (
-        left - bbox.left,
-        top - bbox.top,
-        right - bbox.left,
-        bottom - bbox.top,
+        left,
+        top,
+        right,
+        bottom,
     )
 
 
 def render_envelopes(result: AnalysisResult) -> Image.Image:
-    """Render only the parts of context envelope regions inside the bbox."""
+    """Render envelope regions across the complete original-resolution context."""
 
-    overlay = Image.new("RGBA", _roi_size(result), (0, 0, 0, 0))
+    overlay = Image.new("RGBA", result.transform.source_size, (0, 0, 0, 0))
     fill = Image.new("RGBA", overlay.size, (0, 0, 0, 0))
     fill_draw = ImageDraw.Draw(fill)
     visible_regions: list[tuple[int, tuple[int, int, int, int]]] = []
     for index, region in enumerate(result.envelope_regions):
-        bounds = _region_roi_bounds(result, region.bounds)
-        if bounds is None:
-            continue
+        bounds = _region_context_bounds(result, region.bounds)
         visible_regions.append((index, bounds))
         left, top, right, bottom = bounds
         color = _region_color(index)
@@ -183,7 +154,7 @@ def render_envelopes(result: AnalysisResult) -> Image.Image:
 
 
 def render_density_components(result: AnalysisResult) -> Image.Image:
-    """Render context component pixels and clipped boxes inside the bbox."""
+    """Render component pixels and boxes across the complete context."""
 
     labels = _content_values(result, result.component_labels)
     rgba = np.zeros((*labels.shape, 4), dtype=np.uint8)
@@ -191,15 +162,10 @@ def render_density_components(result: AnalysisResult) -> Image.Image:
         color = _region_color(region.label - 1)
         rgba[labels == region.label] = (*color[:3], 96)
     content_image = Image.fromarray(rgba, mode="RGBA")
-    context_size = result.transform.source_size
-    if content_image.size != context_size:
-        content_image = content_image.resize(context_size, Image.Resampling.NEAREST)
-    overlay = _context_to_roi(result, content_image)
+    overlay = _restore_context(result, content_image, Image.Resampling.NEAREST)
     draw = ImageDraw.Draw(overlay)
     for region in result.component_regions:
-        bounds = _region_roi_bounds(result, region.bounds)
-        if bounds is None:
-            continue
+        bounds = _region_context_bounds(result, region.bounds)
         left, top, right, bottom = bounds
         draw.rectangle(
             (left, top, right - 1, bottom - 1),
@@ -219,13 +185,16 @@ def _composite_full(
     result: AnalysisResult,
     overlay: Image.Image,
 ) -> Image.Image:
-    """Composite an original-bbox overlay onto the full source image."""
+    """Composite a complete-context overlay onto the full source image."""
 
     _validate_image_result(image, result)
-    if overlay.size != _roi_size(result):
-        raise ValueError("overlay dimensions must match the protocol pixel_bbox")
+    if overlay.size != result.transform.source_size:
+        raise ValueError("overlay dimensions must match transform.source_size")
     base = image.convert("RGBA")
-    base.alpha_composite(overlay, (result.pixel_bbox.left, result.pixel_bbox.top))
+    base.alpha_composite(
+        overlay,
+        (result.context_bounds.left, result.context_bounds.top),
+    )
     _draw_semantic_bounds(base, result)
     return base
 

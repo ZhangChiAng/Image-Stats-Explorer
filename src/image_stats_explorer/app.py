@@ -183,7 +183,7 @@ class MainWindow(QMainWindow):
         fit_button = QPushButton("适配窗口")
         fit_button.clicked.connect(self._fit_window)
         controls.addWidget(fit_button)
-        hint = QLabel("左键框选/移动/缩放 bbox；右键拖拽平移；Ctrl+滚轮缩放")
+        hint = QLabel("左键框选/移动/缩放 bbox；右键拖拽平移；滚轮缩放")
         hint.setWordWrap(True)
         controls.addWidget(hint)
 

@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import QWidget
 
 
 class ImageCanvas(QWidget):
-    """Render an image, an analysis overlay, and an editable bbox."""
+    """Render an image, a context overlay, and an editable bbox."""
 
     bbox_changed = Signal(tuple)
     zoom_requested = Signal(float)
@@ -42,6 +50,8 @@ class ImageCanvas(QWidget):
         self._overlay_opacity = 0.58
         self._bbox = None
         self._context_bounds = None
+        self._drag_mode = None
+        self.unsetCursor()
         self._update_canvas_size()
         self.update()
 
@@ -77,14 +87,14 @@ class ImageCanvas(QWidget):
         overlay: QImage | None,
         opacity: float = 1.0,
     ) -> None:
-        """Set one image whose pixel size must match the current bbox."""
+        """Set one image whose pixel size must match the current context."""
 
         candidate = overlay if overlay is not None else QImage()
         candidate_size = (candidate.width(), candidate.height())
-        if self._bbox is None and not candidate.isNull():
-            raise ValueError("an overlay requires a bbox")
-        if not candidate.isNull() and candidate_size != self._bbox[2:]:
-            raise ValueError("overlay dimensions must match the bbox")
+        if self._context_bounds is None and not candidate.isNull():
+            raise ValueError("an overlay requires context bounds")
+        if not candidate.isNull() and candidate_size != self._context_bounds[2:]:
+            raise ValueError("overlay dimensions must match the context")
         self._overlay = candidate
         self._overlay_opacity = opacity
         self.update()
@@ -114,10 +124,15 @@ class ImageCanvas(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         painter.drawPixmap(self.rect(), self._pixmap)
+        context_rect = (
+            self._display_rect(self._context_bounds)
+            if self._context_bounds is not None
+            else None
+        )
         bbox_rect = self._display_rect(self._bbox) if self._bbox else None
-        if not self._overlay.isNull() and bbox_rect is not None:
+        if not self._overlay.isNull() and context_rect is not None:
             painter.setOpacity(self._overlay_opacity)
-            painter.drawImage(bbox_rect, self._overlay)
+            painter.drawImage(context_rect, self._overlay)
             painter.setOpacity(1.0)
         if self._context_bounds is not None:
             pen = QPen(QColor(0, 190, 255), 2, Qt.PenStyle.DashLine)
@@ -166,6 +181,7 @@ class ImageCanvas(QWidget):
         if event.button() == Qt.MouseButton.RightButton:
             self._drag_mode = "pan"
             self._pan_origin = event.globalPosition()
+            self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
             event.accept()
             return
         if event.button() != Qt.MouseButton.LeftButton:
@@ -221,12 +237,11 @@ class ImageCanvas(QWidget):
         self.set_bbox((left, top, right - left, bottom - top), emit=True)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        del event
+        if self._drag_mode == "pan":
+            self.unsetCursor()
+            event.accept()
         self._drag_mode = None
 
     def wheelEvent(self, event) -> None:  # noqa: N802
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.zoom_requested.emit(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
-            event.accept()
-            return
-        super().wheelEvent(event)
+        self.zoom_requested.emit(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
+        event.accept()
