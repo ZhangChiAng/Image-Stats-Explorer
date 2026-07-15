@@ -15,19 +15,19 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QRunnable,
-    QSize,
     QThreadPool,
     Qt,
     Signal,
     Slot,
 )
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -38,8 +38,6 @@ from PySide6.QtWidgets import (
     QScrollBar,
     QSizePolicy,
     QSpinBox,
-    QStyle,
-    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -144,7 +142,10 @@ def _qimage(image: Image.Image) -> QImage:
 
 
 class ParameterInfoIcon(QLabel):
-    """Show a parameter explanation immediately when the pointer enters."""
+    """Paint a small neutral info icon and report pointer transitions."""
+
+    entered = Signal(object)
+    left = Signal(object)
 
     def __init__(self, parameter_name: str, tooltip: str) -> None:
         super().__init__()
@@ -153,23 +154,154 @@ class ParameterInfoIcon(QLabel):
         self.setAccessibleName(f"{parameter_name} 参数说明")
         self.setFixedSize(16, 16)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        icon = QApplication.style().standardIcon(
-            QStyle.StandardPixmap.SP_MessageBoxInformation
+
+    @property
+    def tooltip(self) -> str:
+        return self._tooltip
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        palette = self.palette()
+        background = palette.color(QPalette.ColorRole.Window)
+        dark_background = background.lightness() < 128
+        circle_value = 190 if dark_background else 110
+        circle_color = QColor(circle_value, circle_value, circle_value)
+        text_value = 245 if dark_background else 30
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(circle_color)
+        painter.drawEllipse(self.rect().adjusted(1, 1, -1, -1))
+        painter.setPen(QColor(text_value, text_value, text_value))
+        font = painter.font()
+        font.setBold(True)
+        font.setPixelSize(11)
+        painter.setFont(font)
+        painter.drawText(
+            self.rect(),
+            Qt.AlignmentFlag.AlignCenter,
+            "i",
         )
-        self.setPixmap(icon.pixmap(QSize(16, 16)))
 
     def enterEvent(self, event) -> None:  # noqa: N802
-        del event
-        QToolTip.showText(
-            self.mapToGlobal(QPoint(self.width() + 6, 0)),
-            self._tooltip,
-            self,
-            self.rect(),
-        )
+        super().enterEvent(event)
+        self.entered.emit(self)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
+        super().leaveEvent(event)
+        self.left.emit(self)
+
+
+class ParameterInfoOverlay(QFrame):
+    """Display one parameter explanation while the pointer stays nearby."""
+
+    _OUTER_MARGIN = 4
+    _HORIZONTAL_MARGIN = 8
+    _VERTICAL_MARGIN = 6
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._icon: ParameterInfoIcon | None = None
+        self._label = QLabel(self)
+        self._label.setWordWrap(True)
+        self._label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(
+            self._HORIZONTAL_MARGIN,
+            self._VERTICAL_MARGIN,
+            self._HORIZONTAL_MARGIN,
+            self._VERTICAL_MARGIN,
+        )
+        layout.addWidget(self._label)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMouseTracking(True)
+        self.hide()
+
+    def show_for(self, icon: ParameterInfoIcon) -> None:
+        self._icon = icon
+        self._label.setText(icon.tooltip)
+        self._sync_palette()
+        self._place_for(icon)
+        self.show()
+        self.raise_()
+
+    def hide_if_outside(self, icon: ParameterInfoIcon | None = None) -> None:
+        if self._icon is None or (icon is not None and icon is not self._icon):
+            return
+        cursor = QCursor.pos()
+        if self._contains_global(self._icon, cursor) or self._contains_global(
+            self, cursor
+        ):
+            return
+        self._icon = None
+        self.hide()
+
+    def reposition(self) -> None:
+        if self._icon is not None and self.isVisible():
+            self._place_for(self._icon)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
         del event
-        QToolTip.hideText()
+        palette = self.palette()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(palette.color(QPalette.ColorRole.Mid))
+        painter.setBrush(palette.color(QPalette.ColorRole.ToolTipBase))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 3, 3)
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        super().leaveEvent(event)
+        self.hide_if_outside()
+
+    def _sync_palette(self) -> None:
+        palette = self.palette()
+        label_palette = self._label.palette()
+        label_palette.setColor(
+            QPalette.ColorRole.Text,
+            palette.color(QPalette.ColorRole.ToolTipText),
+        )
+        label_palette.setColor(
+            QPalette.ColorRole.WindowText,
+            palette.color(QPalette.ColorRole.ToolTipText),
+        )
+        self._label.setPalette(label_palette)
+
+    def _place_for(self, icon: ParameterInfoIcon) -> None:
+        host = self.parentWidget()
+        if host is None:
+            return
+        available = host.rect().adjusted(
+            self._OUTER_MARGIN,
+            self._OUTER_MARGIN,
+            -self._OUTER_MARGIN,
+            -self._OUTER_MARGIN,
+        )
+        max_label_width = max(
+            1,
+            available.width() - 2 * self._HORIZONTAL_MARGIN,
+        )
+        self._label.setMaximumWidth(max_label_width)
+        self.adjustSize()
+        width = min(self.width(), available.width())
+        height = min(self.height(), available.height())
+        icon_position = icon.mapTo(host, QPoint(0, 0))
+        x = icon_position.x() - width
+        if x < available.left():
+            x = icon_position.x() + icon.width()
+        x = max(available.left(), min(x, available.right() - width + 1))
+        y = max(
+            available.top(),
+            min(icon_position.y(), available.bottom() - height + 1),
+        )
+        self.setGeometry(x, y, width, height)
+
+    @staticmethod
+    def _contains_global(widget: QWidget, position: QPoint) -> bool:
+        return widget.rect().contains(widget.mapFromGlobal(position))
 
 
 class WorkerSignals(QObject):
@@ -219,11 +351,16 @@ class MainWindow(QMainWindow):
         self._scale = 1.0
         self._thread_pool = QThreadPool.globalInstance()
         self._building_ui = True
+        self._parameter_overlay = ParameterInfoOverlay(self)
         self._build_ui()
         self._building_ui = False
         self._sync_bbox_inputs(None)
         self._show_single()
         self._refresh_actions()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._parameter_overlay.reposition()
 
     def _build_ui(self) -> None:
         page = QWidget()
@@ -458,8 +595,7 @@ class MainWindow(QMainWindow):
         form.addRow(self._parameter_label(label), spin)
         return spin
 
-    @staticmethod
-    def _parameter_label(name: str) -> QWidget:
+    def _parameter_label(self, name: str) -> QWidget:
         label_container = QWidget()
         label_layout = QHBoxLayout(label_container)
         label_layout.setContentsMargins(0, 0, 0, 0)
@@ -468,7 +604,10 @@ class MainWindow(QMainWindow):
         name_label.setWordWrap(False)
         name_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         label_layout.addWidget(name_label)
-        label_layout.addWidget(ParameterInfoIcon(name, "\n".join(PARAMETER_INFO[name])))
+        info_icon = ParameterInfoIcon(name, "\n".join(PARAMETER_INFO[name]))
+        info_icon.entered.connect(self._parameter_overlay.show_for)
+        info_icon.left.connect(self._parameter_overlay.hide_if_outside)
+        label_layout.addWidget(info_icon)
         label_container.setSizePolicy(
             QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred
         )
